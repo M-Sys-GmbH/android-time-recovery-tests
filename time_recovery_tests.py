@@ -6,7 +6,7 @@ Correctness policy (hybrid):
 1) If server delta exists (from connectivity probe), use it:
       abs(server_minus_device_sec) <= threshold_sec
 2) Otherwise, fall back to host-year comparison with New Year tolerance:
-      device_year in {host_year-1, host_year, host_year+1}
+      abs(device_year - host_year) <= year_tolerance
 
 Notes:
 - Setting device time usually requires root / working `su`.
@@ -159,12 +159,10 @@ def year_from_date_line(date_line: str) -> Optional[int]:
 
 
 def bad_year_from_bad_time(bad_time: str) -> int:
-    # bad_time format: MMDDhhmmYYYY.SS
     return int(bad_time[8:12])
 
 
 def set_auto_time(adb: Adb, on: bool) -> None:
-    """Enable/disable Android automatic time + timezone."""
     v = "1" if on else "0"
     adb.shell(f"settings put global auto_time {v}")
     adb.shell(f"settings put global auto_time_zone {v}")
@@ -183,29 +181,19 @@ def enable_wifi(adb: Adb) -> None:
 
 
 def enable_mobile_data(adb: Adb) -> None:
-    adb.shell("svc wifi disable")  # ensure mobile-only preference
     adb.shell("svc data enable")
-    LOG.info("Enabling mobile data (Wi‑Fi disabled)")
+    LOG.info("Enabling mobile data")
 
 
 def force_bad_time(adb: Adb, bad_time: str, reenable_auto_time: bool) -> None:
-    """
-    Force device time to `bad_time`.
-
-    - Turns auto time OFF
-    - Sets date (tries su variants)
-    - Verifies bad time applied (year matches bad_time year)
-    - Optionally turns auto time ON again (depending on test phase)
-    """
     LOG.info("Forcing device time to bad value: %s", bad_time)
-
     set_auto_time(adb, False)
     bad_year = bad_year_from_bad_time(bad_time)
 
+    # Use candidates compatible with your device (su root works, su -c does not)
     candidates = [
-        f'su -c "date {bad_time}"',
-        f"su 0 date {bad_time}",
         f"su root date {bad_time}",
+        f"su 0 date {bad_time}",
         f"date {bad_time}",
     ]
 
@@ -216,11 +204,9 @@ def force_bad_time(adb: Adb, bad_time: str, reenable_auto_time: bool) -> None:
         try:
             out = adb.shell(cmd)
             last_out = out.strip()
-
             device_date = adb.shell("date").strip()
             y = year_from_date_line(device_date)
             LOG.debug("After '%s' -> date='%s' year=%s", cmd, device_date, y)
-
             if y is not None and y == bad_year:
                 applied = True
                 LOG.info("Bad time applied successfully: %s", device_date)
@@ -240,7 +226,7 @@ def force_bad_time(adb: Adb, bad_time: str, reenable_auto_time: bool) -> None:
 
 
 # -----------------------------
-# Parsing helpers
+# Parsing helpers (alarm/connectivity)
 # -----------------------------
 def parse_alarm(text: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {
@@ -300,7 +286,6 @@ def parse_connectivity(text: str) -> Dict[str, Any]:
             out["server_date_hdr"] = m_date.group(1).strip()
             out["received_ms"] = int(m_recv.group(1))
             server_dt = try_parse_http_date(out["server_date_hdr"])
-
             if server_dt:
                 device_dt = datetime.fromtimestamp(out["received_ms"] / 1000.0, tz=timezone.utc)
                 out["server_minus_device_sec"] = (server_dt - device_dt).total_seconds()
@@ -311,7 +296,210 @@ def parse_connectivity(text: str) -> Dict[str, Any]:
 
 
 # -----------------------------
-# Correctness logic (HYBRID + New Year tolerance)
+# DUT collection helpers
+# -----------------------------
+def _battery_status_text(code: Optional[int]) -> str:
+    return {
+        1: "Unknown",
+        2: "Charging",
+        3: "Discharging",
+        4: "Not charging",
+        5: "Full",
+    }.get(code, f"Unknown({code})" if code is not None else "Unknown")
+
+
+def _battery_health_text(code: Optional[int]) -> str:
+    return {
+        1: "Unknown",
+        2: "Good",
+        3: "Overheat",
+        4: "Dead",
+        5: "Over voltage",
+        6: "Unspecified failure",
+        7: "Cold",
+    }.get(code, f"Unknown({code})" if code is not None else "Unknown")
+
+
+def parse_battery_dumpsys(text: str) -> Dict[str, Any]:
+    def pick_bool(key: str) -> Optional[bool]:
+        m = re.search(rf"^\s*{re.escape(key)}:\s*(true|false)\s*$", text, re.M)
+        return {"true": True, "false": False}.get(m.group(1)) if m else None
+
+    def pick_int(key: str) -> Optional[int]:
+        m = re.search(rf"^\s*{re.escape(key)}:\s*(-?\d+)\s*$", text, re.M)
+        return int(m.group(1)) if m else None
+
+    def pick_str(key: str) -> Optional[str]:
+        m = re.search(rf"^\s*{re.escape(key)}:\s*(.+?)\s*$", text, re.M)
+        return m.group(1).strip() if m else None
+
+    status = pick_int("status")
+    health = pick_int("health")
+    temp_tenths_c = pick_int("temperature")
+    temp_c = (temp_tenths_c / 10.0) if temp_tenths_c is not None else None
+
+    return {
+        "ac_powered": pick_bool("AC powered"),
+        "usb_powered": pick_bool("USB powered"),
+        "wireless_powered": pick_bool("Wireless powered"),
+        "status_code": status,
+        "status_text": _battery_status_text(status),
+        "health_code": health,
+        "health_text": _battery_health_text(health),
+        "present": pick_bool("present"),
+        "level": pick_int("level"),
+        "scale": pick_int("scale"),
+        "voltage_mv": pick_int("voltage"),
+        "temperature_tenths_c": temp_tenths_c,
+        "temperature_c": temp_c,
+        "technology": pick_str("technology"),
+        "charge_counter": pick_int("Charge counter"),
+        "max_charging_current": pick_int("Max charging current"),
+        "max_charging_voltage": pick_int("Max charging voltage"),
+    }
+
+
+def parse_default_network_line(connectivity_text: str) -> Dict[str, Any]:
+    m = re.search(r"Active default network:\s*(.+)\s*$", connectivity_text, re.M)
+    val = m.group(1).strip() if m else None
+    return {
+        "active_default_network_raw": val,
+        "active_default_none": (val == "none"),
+        "active_default_network_id": int(val) if (val and val.isdigit()) else None,
+    }
+
+
+def sh_quote(s: str) -> str:
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+def adb_read_file_best_effort(adb: Adb, path: str, try_su: bool = True) -> Dict[str, Any]:
+    """
+    Try to read a sysfs file.
+    - normal cat
+    - if permission denied: try 'su root' then 'su 0'
+    Never treats 'su:' errors as valid values.
+    """
+    def classify(out: str) -> Dict[str, Any]:
+        o = (out or "").strip()
+        lower = o.lower()
+
+        if lower.startswith("su:") or "invalid uid/gid" in lower:
+            return {"ok": False, "value": None, "error": o}
+
+        if "permission denied" in lower:
+            return {"ok": False, "value": None, "error": "permission denied"}
+
+        if "no such file" in lower or "not found" in lower:
+            return {"ok": False, "value": None, "error": "not found"}
+
+        if o == "":
+            return {"ok": False, "value": None, "error": "empty"}
+
+        return {"ok": True, "value": o, "error": None}
+
+    quoted = sh_quote(path)
+
+    out = adb.shell(f"cat {quoted}").strip()
+    res = classify(out)
+    if res["ok"]:
+        res["source"] = "cat"
+        return res
+
+    if res["error"] == "not found":
+        res["source"] = "cat"
+        return res
+
+    if try_su and res["error"] == "permission denied":
+        candidates = [
+            f"su root cat {quoted}",
+            f"su 0 cat {quoted}",
+        ]
+        last = out
+        for cmd in candidates:
+            out2 = adb.shell(cmd).strip()
+            last = out2
+            r2 = classify(out2)
+            if r2["ok"]:
+                r2["source"] = cmd.split()[:2]  # ['su','root'] or ['su','0']
+                return r2
+        return {"ok": False, "value": None, "error": "permission denied (even with su)", "source": "root", "last": last}
+
+    res["source"] = "cat"
+    return res
+
+
+def adb_read_any_path_best_effort(adb: Adb, paths: List[str], try_su: bool = True) -> Dict[str, Any]:
+    last = {"ok": False, "value": None, "error": "not found", "source": None, "path": None}
+    for p in paths:
+        r = adb_read_file_best_effort(adb, p, try_su=try_su)
+        r["path"] = p
+        if r.get("ok"):
+            return r
+        last = r
+        last["path"] = p
+    return last
+
+
+def collect_dut_info(adb: Adb) -> Dict[str, Any]:
+    props = {
+        "manufacturer": adb.shell("getprop ro.product.manufacturer").strip(),
+        "model": adb.shell("getprop ro.product.model").strip(),
+        "device": adb.shell("getprop ro.product.device").strip(),
+        "android_release": adb.shell("getprop ro.build.version.release").strip(),
+        "sdk": adb.shell("getprop ro.build.version.sdk").strip(),
+        "fingerprint": adb.shell("getprop ro.build.fingerprint").strip(),
+        "security_patch": adb.shell("getprop ro.build.version.security_patch").strip(),
+        "kernel": adb.shell("uname -a").strip(),
+    }
+
+    time_cfg = {
+        "auto_time": adb.shell("settings get global auto_time").strip(),
+        "auto_time_zone": adb.shell("settings get global auto_time_zone").strip(),
+        "timezone": adb.shell("getprop persist.sys.timezone").strip(),
+        "device_date_now": adb.shell("date").strip(),
+    }
+
+    battery = parse_battery_dumpsys(adb.shell("dumpsys battery"))
+    default_net = parse_default_network_line(adb.shell("dumpsys connectivity"))
+    alarm = parse_alarm(adb.shell("dumpsys alarm"))
+
+    sysfs = {
+        "cycle_count": adb_read_any_path_best_effort(adb, [
+            "/sys/class/power_supply/battery/cycle_count",
+            "/sys/class/power_supply/bms/cycle_count",
+            "/sys/class/power_supply/bq27541-0/cycle_count",
+        ]),
+        "charge_full": adb_read_any_path_best_effort(adb, [
+            "/sys/class/power_supply/battery/charge_full",
+            "/sys/class/power_supply/bms/charge_full",
+            "/sys/class/power_supply/bq27541-0/charge_full",
+        ]),
+        "charge_full_design": adb_read_any_path_best_effort(adb, [
+            "/sys/class/power_supply/bms/charge_full_design",
+            "/sys/class/power_supply/bq27541-0/charge_full_design",
+            "/sys/class/power_supply/battery/charge_full_design",
+        ]),
+    }
+
+    return {
+        "props": props,
+        "time": time_cfg,
+        "battery": battery,
+        "battery_sysfs": sysfs,
+        "connectivity": default_net,
+        "alarm": {
+            "time_change_events": alarm.get("time_change_events"),
+            "ntp_poll_present": alarm.get("ntp_poll_present"),
+            "ntp_poll_past_due": alarm.get("ntp_poll_past_due"),
+            "nowRTC_ms": alarm.get("nowRTC_ms"),
+            "nowELAPSED_ms": alarm.get("nowELAPSED_ms"),
+        },
+    }
+
+
+# -----------------------------
+# Correctness logic
 # -----------------------------
 def is_time_correct(
     device_year: Optional[int],
@@ -319,25 +507,17 @@ def is_time_correct(
     threshold_sec: int,
     year_tolerance: int
 ) -> bool:
-    """
-    Correctness:
-    Gate 0: device year must be within host_year +/- year_tolerance
-            (prevents stale/meaningless server-delta false positives when clock is in year 2000)
-    Then:
-      - If server delta exists: authoritative threshold check
-      - Else: year window check is sufficient
-    """
     if device_year is None:
         return False
 
     host_year = datetime.now().year
     if abs(device_year - host_year) > year_tolerance:
-        return False  # clock is clearly wrong (e.g., 2000), don't trust server delta
+        return False
 
     if server_minus_device_sec is not None:
         return abs(server_minus_device_sec) <= threshold_sec
 
-    return True  # year is within tolerance and no server delta available
+    return True
 
 
 # -----------------------------
@@ -483,8 +663,6 @@ def wait_for_correction(adb: Adb,
         sample, prev_alarm = take_snapshot(adb, phase, sample_idx, "poll", raw_dir, save_raw, prev_alarm)
         samples_out.append(sample)
 
-        # IMPORTANT: don't trust server_delta when Android says there is no default network.
-        # PROBE_HTTP info can be stale in dumpsys connectivity while offline.
         server_delta = sample.server_minus_device_sec
         if sample.active_default_none:
             server_delta = None
@@ -529,13 +707,6 @@ def _esc(x: Any) -> str:
 
 
 def _format_server_offset_cell(s: Sample, stale_threshold_sec: int = 86400) -> str:
-    """
-    Render the Server time offset cell.
-    Marks it as "stale" if:
-      - sample is offline (no default network), OR
-      - abs(offset) > stale_threshold_sec (default: 1 day)
-    Purely for readability. Does NOT affect pass/fail.
-    """
     if s.server_minus_device_sec is None:
         return "<td></td>"
 
@@ -543,7 +714,6 @@ def _format_server_offset_cell(s: Sample, stale_threshold_sec: int = 86400) -> s
     is_stale = s.active_default_none or abs(offset) > stale_threshold_sec
 
     if is_stale:
-        # show the number but label it stale and add tooltip
         return (
             "<td title='Offset likely stale (offline or unusually large).'>"
             f"{_esc(offset)} <span style='color:#888'>(stale)</span>"
@@ -554,25 +724,14 @@ def _format_server_offset_cell(s: Sample, stale_threshold_sec: int = 86400) -> s
 
 
 def _note_meaning(sample: Sample, run_info: Dict[str, Any]) -> str:
-    """
-    Convert internal Sample.notes (baseline/poll/prep/persist) into a tester-friendly meaning.
-
-    We also try to detect if the device time *looks* corrected to label poll samples as
-    "Waiting" vs "Corrected".
-    """
-    # Default tolerance (New Year) if not present in run_info
     year_tol = int(run_info.get("parameters", {}).get("year_tolerance", 1))
     host_year = datetime.now().year
-
-    # Heuristic: year close to host year => "looks corrected"
     looks_correct_by_year = (
         sample.device_year is not None and abs(sample.device_year - host_year) <= year_tol
     )
-
     tag = (sample.notes or "").strip().lower()
 
     if tag == "baseline":
-        # In TC1 baseline this means "offline and should stay wrong"
         return "⛔ Offline baseline — time must stay wrong"
     if tag == "prep":
         return "⛔ Offline prep — time must stay wrong"
@@ -580,40 +739,153 @@ def _note_meaning(sample: Sample, run_info: Dict[str, Any]) -> str:
         return "🔁 Post‑reboot — verify time persists offline"
 
     if tag == "poll":
-        # During correction phases
         if looks_correct_by_year:
-            # Optionally hint whether we had server delta
             if sample.server_minus_device_sec is not None:
                 return "✅ Time corrected (server‑aligned)"
             return "✅ Time corrected"
         return "⏳ Waiting for time correction"
 
-    # Fallback: show original tag if unexpected
     return sample.notes
 
 
 def _render_run_info(run_info: Dict[str, Any]) -> str:
-    return "<h2>Run Info</h2>\n<pre>" + _esc(json.dumps(run_info, indent=2)) + "</pre>"
+    pretty = _esc(json.dumps(run_info, indent=2))
+    return (
+        "<h2>Run Info</h2>"
+        "<details>"
+        "<summary style='cursor:pointer; font-weight:600;'>Click to expand</summary>"
+        f"<pre>{pretty}</pre>"
+        "</details>"
+    )
+
+
+def format_uah_as_mah(value_str: Optional[str]) -> str:
+    if not value_str:
+        return ""
+    try:
+        uah = int(value_str.strip())
+        mah = uah / 1000.0
+        return f"{uah} µAh (~{mah:.0f} mAh)"
+    except Exception:
+        return value_str
+
+
+def _render_dut_info(dut: Dict[str, Any]) -> str:
+    if not dut:
+        return "<h2>Device Under Test (DUT)</h2><p><i>No DUT information captured.</i></p>"
+
+    props = dut.get("props", {})
+    time_cfg = dut.get("time", {})
+    bat = dut.get("battery", {})
+    net = dut.get("connectivity", {})
+    alarm = dut.get("alarm", {})
+    sysfs = dut.get("battery_sysfs", {})
+
+    def yesno(v: Any) -> str:
+        if v is True:
+            return "Yes"
+        if v is False:
+            return "No"
+        return ""
+
+    def sysfs_field(name: str, format_as_uah: bool = False) -> str:
+        item = sysfs.get(name) or {}
+        if item.get("ok"):
+            val = item.get("value")
+            if format_as_uah:
+                val = format_uah_as_mah(val)
+            extra = ""
+            if item.get("path"):
+                extra = f" <span style='color:#888'>({item.get('path')})</span>"
+            return _esc(val) + extra
+        err = item.get("error")
+        return _esc(f"Not available ({err})") if err else "Not available"
+
+    powered = []
+    if bat.get("ac_powered"): powered.append("AC")
+    if bat.get("usb_powered"): powered.append("USB")
+    if bat.get("wireless_powered"): powered.append("Wireless")
+    powered_str = ", ".join(powered) if powered else "No"
+
+    default_net_raw = net.get("active_default_network_raw")
+    if default_net_raw is None:
+        default_net_disp = "Unknown"
+    elif net.get("active_default_none"):
+        default_net_disp = "none (offline)"
+    else:
+        default_net_disp = f"{default_net_raw} (online)"
+
+    temp_c = bat.get("temperature_c")
+    temp_disp = f"{temp_c:.1f} °C" if isinstance(temp_c, (int, float)) else ""
+
+    rows: List[str] = []
+    rows.append("<h2>Device Under Test (DUT)</h2>")
+
+    rows.append("<h3>Device & Build</h3>")
+    rows.append("<table border='1' cellpadding='6' cellspacing='0'>")
+    rows.append("<tr><th>Field</th><th>Value</th></tr>")
+    rows.append(f"<tr><td>Manufacturer</td><td>{_esc(props.get('manufacturer'))}</td></tr>")
+    rows.append(f"<tr><td>Model</td><td>{_esc(props.get('model'))}</td></tr>")
+    rows.append(f"<tr><td>Device</td><td>{_esc(props.get('device'))}</td></tr>")
+    rows.append(f"<tr><td>Android</td><td>{_esc(props.get('android_release'))} (SDK {_esc(props.get('sdk'))})</td></tr>")
+    rows.append(f"<tr><td>Security patch</td><td>{_esc(props.get('security_patch'))}</td></tr>")
+    rows.append(f"<tr><td>Build fingerprint</td><td><code>{_esc(props.get('fingerprint'))}</code></td></tr>")
+    rows.append(f"<tr><td>Kernel</td><td><code>{_esc(props.get('kernel'))}</code></td></tr>")
+    rows.append("</table>")
+
+    rows.append("<h3>Time Configuration</h3>")
+    rows.append("<table border='1' cellpadding='6' cellspacing='0'>")
+    rows.append("<tr><th>Field</th><th>Value</th></tr>")
+    rows.append(f"<tr><td>Auto time</td><td>{_esc(time_cfg.get('auto_time'))}</td></tr>")
+    rows.append(f"<tr><td>Auto time zone</td><td>{_esc(time_cfg.get('auto_time_zone'))}</td></tr>")
+    rows.append(f"<tr><td>Time zone</td><td>{_esc(time_cfg.get('timezone'))}</td></tr>")
+    rows.append(f"<tr><td>Device date (start)</td><td>{_esc(time_cfg.get('device_date_now'))}</td></tr>")
+    rows.append("</table>")
+
+    rows.append("<h3>Battery</h3>")
+    rows.append("<table border='1' cellpadding='6' cellspacing='0'>")
+    rows.append("<tr><th>Field</th><th>Value</th></tr>")
+    rows.append(f"<tr><td>Level</td><td>{_esc(bat.get('level'))}%</td></tr>")
+    rows.append(f"<tr><td>Status</td><td>{_esc(bat.get('status_text'))} ({_esc(bat.get('status_code'))})</td></tr>")
+    rows.append(f"<tr><td>Health</td><td>{_esc(bat.get('health_text'))} ({_esc(bat.get('health_code'))})</td></tr>")
+    rows.append(f"<tr><td>Temperature</td><td>{_esc(temp_disp)}</td></tr>")
+    rows.append(f"<tr><td>Voltage</td><td>{_esc(bat.get('voltage_mv'))} mV</td></tr>")
+    rows.append(f"<tr><td>Powered by</td><td>{_esc(powered_str)}</td></tr>")
+    rows.append(f"<tr><td>Technology</td><td>{_esc(bat.get('technology'))}</td></tr>")
+    rows.append(f"<tr><td>Cycle count</td><td>{sysfs_field('cycle_count')}</td></tr>")
+    rows.append(f"<tr><td>Charge full</td><td>{sysfs_field('charge_full', format_as_uah=True)}</td></tr>")
+    rows.append(f"<tr><td>Charge full design</td><td>{sysfs_field('charge_full_design', format_as_uah=True)}</td></tr>")
+    rows.append("</table>")
+
+    rows.append("<h3>Network & Time Observations</h3>")
+    rows.append("<table border='1' cellpadding='6' cellspacing='0'>")
+    rows.append("<tr><th>Field</th><th>Value</th></tr>")
+    rows.append(f"<tr><td>Active default network</td><td>{_esc(default_net_disp)}</td></tr>")
+    rows.append(f"<tr><td>Time change events</td><td>{_esc(alarm.get('time_change_events'))}</td></tr>")
+    rows.append(f"<tr><td>NTP poll present</td><td>{_esc(yesno(alarm.get('ntp_poll_present')))}</td></tr>")
+    rows.append(f"<tr><td>NTP poll past-due</td><td>{_esc(yesno(alarm.get('ntp_poll_past_due')))}</td></tr>")
+    if "rtc_persistence_observed" in dut:
+        rows.append(f"<tr><td>RTC persistence observed (TC4)</td><td>{_esc('Yes' if dut.get('rtc_persistence_observed') else 'No')}</td></tr>")
+    rows.append("</table>")
+
+    return "\n".join(rows)
 
 
 def _render_glossary() -> str:
-    # Short, first-timer friendly explanations
     items = [
         ("Host time",
          "Timestamp on the PC when the sample was taken (ISO format; easy to sort)."),
         ("Device date",
          "Raw output of `adb shell date` from the device (format depends on device locale/timezone)."),
-        ("No default network (offline)",
-         "Offline means Android reports 'Active default network: none' (no default route). "
-         "Online means a default network exists (Wi‑Fi or mobile)."),
+        ("Network",
+         "Offline means 'Active default network: none'. Online means a default network exists."),
         ("Server time offset (s)",
-         "Estimated server_time − device_time from Android HTTP probe (Date header vs received time). "
-         "Near 0 means device time is close to server time."),
+         "Estimated server_time − device_time from Android HTTP probe. Near 0 means device time is close to server time."),
         ("Wall‑clock jump (ms)",
-         "Difference between wall clock progress (RTC) and monotonic time (ELAPSED) since the previous sample. "
-         "Large values usually mean the wall clock jumped (time correction)."),
+         "Difference between wall clock progress (RTC) and monotonic time (ELAPSED) since the previous sample. Large values usually mean time correction."),
+        ("Meaning",
+         "Human-friendly explanation of why/when the sample was taken."),
     ]
-
     li = "\n".join(f"<li><b>{_esc(k)}:</b> {_esc(v)}</li>" for k, v in items)
     return "<h2>Glossary</h2>\n<ul>" + li + "</ul>"
 
@@ -639,16 +911,26 @@ def _render_summary_table(phase_results: List[PhaseResult]) -> str:
 
 
 def _render_phase_details(run_info: Dict[str, Any], samples: List[Sample], last_n_per_phase: int) -> str:
+    # Only render phases that were executed (from run_info parameters).
+    selected = run_info.get("parameters", {}).get("selected_phases", [])
+    if not selected:
+        selected = list(PHASE_DESC.keys())
+
     by_phase: Dict[str, List[Sample]] = {}
     for s in samples:
         by_phase.setdefault(s.phase, []).append(s)
 
     out: List[str] = ["<h2>Details (last samples per phase)</h2>"]
-    for phase, desc in PHASE_DESC.items():
+    for phase in selected:
+        desc = PHASE_DESC.get(phase, "")
         out.append(f"<h3>{_esc(phase)}</h3>")
         out.append(f"<p>{_esc(desc)}</p>")
 
         phase_samples = by_phase.get(phase, [])
+        if not phase_samples:
+            out.append("<p><i>No samples for this phase.</i></p>")
+            continue
+
         tail = phase_samples[-last_n_per_phase:]
 
         out.append("<table border='1' cellpadding='6' cellspacing='0'>")
@@ -656,20 +938,16 @@ def _render_phase_details(run_info: Dict[str, Any], samples: List[Sample], last_
             "<tr>"
             "<th title='Sample index within this phase.'>#</th>"
             "<th title='Timestamp on the host PC when the sample was taken (ISO 8601).'>Host time</th>"
-            "<th title='Raw output of `adb shell date` from the device (format depends on device).'>Device date</th>"
-            "<th title='Year parsed from Device date (quick sanity check).'>Year</th>"
-            "<th title=\"True means Android reports 'Active default network: none' (no default route). "
-            "False means a default network exists (Wi‑Fi or mobile).\">No default network (offline)</th>"
-            "<th title='Estimated server_time − device_time from Android connectivity HTTP probe. "
-            "Near 0 means device time is close to server time.'>Server time offset (s)</th>"
-            "<th title='RTC minus ELAPSED deviation between samples. Large values usually indicate a wall-clock jump "
-            "(time correction) or a reboot boundary.'>Wall‑clock jump (ms)</th>"
-            "<th title='Tag describing why the sample was taken (baseline/poll/persist/etc.).'>Notes</th>"
+            "<th title='Raw output of `adb shell date` from the device.'>Device date</th>"
+            "<th title='Year parsed from Device date.'>Year</th>"
+            "<th title=\"Offline means 'Active default network: none'. Online means a default network exists.\">Network</th>"
+            "<th title='Estimated server_time − device_time from HTTP probe. Labeled (stale) when offline or unusually large.'>Server time offset (s)</th>"
+            "<th title='RTC minus ELAPSED deviation between samples.'>Wall‑clock jump (ms)</th>"
+            "<th title='Tester-friendly meaning of this snapshot.'>Meaning</th>"
             "</tr>"
         )
         for s in tail:
             net_state = "Offline" if s.active_default_none else "Online"
-
             out.append(
                 "<tr>"
                 f"<td>{_esc(s.sample)}</td>"
@@ -702,6 +980,7 @@ def render_html_report(run_info: Dict[str, Any],
         "</head><body>",
         "<h1>Android Time Recovery Test Report</h1>",
         _render_run_info(run_info),
+        _render_dut_info(run_info.get("dut", {})),
         _render_glossary(),
         _render_summary_table(phase_results),
         _render_phase_details(run_info, samples, last_n_per_phase),
@@ -723,7 +1002,6 @@ def phase_tc1(adb: Adb, args: argparse.Namespace, raw_dir: Path,
     bad_year = bad_year_from_bad_time(args.bad_time)
 
     def fail_if_time_changed(s: Sample) -> bool:
-        # TC1 should remain at the forced bad year
         return s.device_year is not None and s.device_year != bad_year
 
     start_host = datetime.now().isoformat(timespec="seconds")
@@ -757,7 +1035,6 @@ def phase_tc2(adb: Adb, args: argparse.Namespace, raw_dir: Path,
               prev_alarm: Optional[Dict[str, Any]], all_samples: List[Sample]) -> Tuple[PhaseResult, Optional[Dict[str, Any]]]:
     phase = "TC2_EnableWifi_WaitCorrection"
 
-    # Prevent snap-back before enabling Wi‑Fi
     disable_networks(adb)
     force_bad_time(adb, args.bad_time, reenable_auto_time=False)
     enable_wifi(adb)
@@ -795,7 +1072,6 @@ def phase_tc3(adb: Adb, args: argparse.Namespace, raw_dir: Path,
     phase_prep = "TC3_PreMobile_BadTime_NoNetwork"
     phase = "TC3_EnableMobile_WaitCorrection"
 
-    # Keep auto_time OFF while mobile is OFF, to avoid NITZ/cached snap-back
     disable_networks(adb)
     force_bad_time(adb, args.bad_time, reenable_auto_time=False)
 
@@ -805,7 +1081,6 @@ def phase_tc3(adb: Adb, args: argparse.Namespace, raw_dir: Path,
         all_samples.append(s)
         time.sleep(args.interval_sec)
 
-    # Now enable correction path
     set_auto_time(adb, True)
     enable_mobile_data(adb)
 
@@ -840,7 +1115,6 @@ def phase_tc4(adb: Adb, args: argparse.Namespace, raw_dir: Path,
               prev_alarm: Optional[Dict[str, Any]], all_samples: List[Sample]) -> Tuple[PhaseResult, Optional[Dict[str, Any]]]:
     phase = "TC4_Reboot_NetOff_PersistCheck"
 
-    # TC4 assumes time is already corrected by TC2/TC3.
     disable_networks(adb)
 
     start_host = datetime.now().isoformat(timespec="seconds")
@@ -855,8 +1129,6 @@ def phase_tc4(adb: Adb, args: argparse.Namespace, raw_dir: Path,
     disable_networks(adb)
 
     def fail_if_time_looks_bad(s: Sample) -> bool:
-        # For TC4, treat "correct" as hybrid: if server delta exists it may be stale offline,
-        # so we enforce fallback by year tolerance only here.
         if s.device_year is None:
             return True
         host_year = datetime.now().year
@@ -903,10 +1175,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--timeout-sec", type=int, default=60, help="Max seconds to wait for time correction phases (default: 60)")
     ap.add_argument("--threshold-sec", type=int, default=300,
                     help="Max allowed server-device delta (seconds) when server date is available (default: 300)")
-
     ap.add_argument("--year-tolerance", type=int, default=1,
                     help="Fallback year tolerance when server delta is unavailable (default: 1, for New Year)")
-
     ap.add_argument("--boot-timeout-sec", type=int, default=240,
                     help="Max seconds to wait for sys.boot_completed after reboot")
     ap.add_argument("--bad-time", default=BAD_TIME_DEFAULT,
@@ -1008,6 +1278,9 @@ def main() -> None:
     LOG.info("Report JSON: %s", report_json)
     LOG.info("Report HTML: %s\n", report_html)
 
+    LOG.info("Collecting DUT info (device/build/battery/time)...")
+    dut_info = collect_dut_info(adb)
+
     run_info = {
         "timestamp_local": datetime.now().isoformat(timespec="seconds"),
         "serial": serial,
@@ -1026,6 +1299,7 @@ def main() -> None:
             "save_raw": args.save_raw,
             "selected_phases": selected_phases,
         },
+        "dut": dut_info,
         "output_paths": {
             "report_json": str(report_json),
             "report_html": str(report_html),
@@ -1044,12 +1318,20 @@ def main() -> None:
         "TC4_Reboot_NetOff_PersistCheck": phase_tc4,
     }
 
+    tc4_pass_value: Optional[bool] = None
+
     for phase_name in selected_phases:
         LOG.info("\n=== %s ===", phase_name)
         LOG.info("%s", PHASE_DESC.get(phase_name, ""))
 
         result, prev_alarm = runners[phase_name](adb, args, raw_dir, prev_alarm, all_samples)
         phase_results.append(result)
+
+        if phase_name == "TC4_Reboot_NetOff_PersistCheck":
+            tc4_pass_value = bool(result.passed)
+
+    if tc4_pass_value is not None:
+        run_info["dut"]["rtc_persistence_observed"] = tc4_pass_value
 
     report = {
         "run": run_info,
@@ -1064,7 +1346,11 @@ def main() -> None:
         metric = f" time_to_correct={r.time_to_correct_seconds}s" if r.time_to_correct_seconds is not None else ""
         LOG.info("- %s: %s%s", r.phase, "PASS" if r.passed else "FAIL", metric)
         LOG.info("  %s", r.description)
-        LOG.info("  %s", r.notes)
+        LOG.info("  %s\n", r.notes)
+
+    # Restore connectivity for convenience after tests
+    enable_mobile_data(adb)
+    enable_wifi(adb)
 
     LOG.info("\n=== DONE ===")
     LOG.info("Results: %s", out_dir)
